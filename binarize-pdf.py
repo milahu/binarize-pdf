@@ -9,6 +9,7 @@ import cv2
 from pdf2image import convert_from_path
 from PIL import Image
 from tqdm import tqdm
+import doxapy
 
 
 def mean_std(im, window_size):
@@ -83,74 +84,44 @@ def calculate_adaptive_window_size(image_shape):
     return window_size
 
 
-def sauvola(im, k=0.2, window_size=None):
-    """
-    Sauvola binarization algorithm.
-    Adapts to local content while being robust against noise.
-    Window size is automatically calculated if not provided.
-    """
-    assert im.dtype == np.uint8
-    
-    if window_size is None:
-        window_size = calculate_adaptive_window_size(im.shape)
-    
-    means, stds = mean_std(im, window_size)
-    thresh = means * (1 + k * ((stds / 127) - 1))
-    return (im > thresh).astype(np.uint8) * 255
-
-
-def adaptive_otsu(im):
-    """
-    Adaptive Otsu binarization with background normalization.
-    Good for handling uneven illumination.
-    """
-    im_h, _ = im.shape
-    s = (im_h // 200) | 1
-    ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (s, s))
-    background = cv2.morphologyEx(im, cv2.MORPH_DILATE, ellipse)
-    bg_float = background.astype(np.float64)
-
-    # Normalize using background estimation
-    C = np.percentile(im, 30)
-    normalized = np.clip(C / (bg_float + 1e-10) * im, 0, 255).astype(np.uint8)
-
-    # Apply Otsu's method
-    _, binary = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    return binary
-
-
-def binarize_image(image, sauvola_k=0.2):
+def binarize_image(pil_img, args):
     """
     Apply binarization to an image using a combination of methods.
     Uses adaptive window size for Sauvola binarization.
     """
+    # Convert PIL to numpy
+    np_img = np.array(pil_img)
+
     # Convert to grayscale if needed
-    if len(image.shape) > 2:
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = image
-
-    window_size = calculate_adaptive_window_size(gray.shape)
-    print(f"Using adaptive window size: {window_size}")
-    
-    sauvola_result = sauvola(gray, k=sauvola_k, window_size=window_size)
-    otsu_result = adaptive_otsu(gray)
-    h, w = gray.shape
-    if sauvola_result.shape != gray.shape:
-        print("Resizing sauvola result")
-        sauvola_result = cv2.resize(
-            sauvola_result, (w, h), interpolation=cv2.INTER_NEAREST
+    if pil_img.mode != "L":
+        np_img = doxapy.to_grayscale(
+            doxapy.GrayscaleAlgorithms.MEAN,
+            np_img
         )
-    if otsu_result.shape != gray.shape:
-        print("Resizing otsu result")
-        otsu_result = cv2.resize(otsu_result, (w, h), interpolation=cv2.INTER_NEAREST)
 
-    print(f"Final shapes - Sauvola: {sauvola_result.shape}, Otsu: {otsu_result.shape}")
+    window_size = calculate_adaptive_window_size(np_img.shape)
+    # print(f"Using adaptive window size: {window_size}")
 
-    # Combine results - take the more conservative approach
-    combined = cv2.bitwise_and(sauvola_result, otsu_result)
+    ALGO_MAP = {
+        "otsu": doxapy.Binarization.Algorithms.OTSU,
+        "niblack": doxapy.Binarization.Algorithms.NIBLACK,
+        "sauvola": doxapy.Binarization.Algorithms.SAUVOLA,
+        "wolf": doxapy.Binarization.Algorithms.WOLF,
+    }
 
-    return combined
+    algo = ALGO_MAP[args.algo]
+
+    options = {
+        "window": window_size,
+        "k": args.threshold_sensitivity,
+    }
+
+    binary = doxapy.to_binary(algo, np_img, options)
+
+    # todo resize?
+
+    # Convert back to PIL
+    return Image.fromarray(binary)
 
 
 def main():
@@ -158,6 +129,12 @@ def main():
     parser.add_argument('input_pdf', help='Input PDF file')
     parser.add_argument('--threshold-sensitivity', type=float, default=0.2,
                        help='Sauvola threshold sensitivity (k value). Higher values produce darker output. Default: 0.2')
+    parser.add_argument(
+        "--algo",
+        default="sauvola",
+        choices=["otsu", "niblack", "sauvola", "wolf"],
+        help="image binarization algorithm",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input_pdf)
@@ -180,10 +157,8 @@ def main():
         processed_pages = []
 
         for page in tqdm(pages):
-            np_image = np.array(page)
-            binary = binarize_image(np_image, sauvola_k=args.threshold_sensitivity)
-            processed_page = Image.fromarray(binary)
-            processed_pages.append(processed_page)
+            binary = binarize_image(page, args)
+            processed_pages.append(binary)
 
         print(f"Saving binarized PDF to {output_path}...")
         if processed_pages:
@@ -200,6 +175,7 @@ def main():
 
     except Exception as e:
         print(f"Error processing PDF: {str(e)}")
+        raise e
         sys.exit(1)
 
 

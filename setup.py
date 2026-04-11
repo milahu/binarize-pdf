@@ -14,6 +14,7 @@ setup(
         "numpy",
         "Pillow",
         "tqdm",
+        "doxapy",
     ],
     python_requires=">=3.8",
 )
