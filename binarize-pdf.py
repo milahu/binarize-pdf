@@ -1,14 +1,4 @@
-#!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.8"
-# dependencies = [
-#     "pdf2image",
-#     "opencv-python",
-#     "numpy",
-#     "Pillow",
-#     "tqdm",
-# ]
-# ///
+#!/usr/bin/env python3
 
 import sys
 import os
