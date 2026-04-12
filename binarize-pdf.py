@@ -135,6 +135,11 @@ def main():
         choices=["otsu", "niblack", "sauvola", "wolf"],
         help="image binarization algorithm",
     )
+    parser.add_argument(
+        "--dpi", # args.dpi
+        default=600,
+        type=int,
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input_pdf)
@@ -151,7 +156,10 @@ def main():
     try:
         # Convert PDF to images
         print(f"Converting {input_path.name} to images...")
-        pages = convert_from_path(str(input_path))
+        kwargs = dict(
+            dpi=args.dpi,
+        )
+        pages = convert_from_path(str(input_path), **kwargs)
 
         # Process each page
         processed_pages = []
