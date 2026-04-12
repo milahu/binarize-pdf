@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import cv2
 from pdf2image import convert_from_path
+import pdf2image
+import pymupdf
 from PIL import Image
 from tqdm import tqdm
 import doxapy
@@ -124,6 +126,40 @@ def binarize_image(pil_img, args):
     return Image.fromarray(binary)
 
 
+def pdf2image_iter_from_path(path, **kwargs):
+    """
+    stream page images
+    minimize memory usage for large input files
+    """
+    # https://github.com/Belval/pdf2image/issues/197
+    info = pdf2image.pdfinfo_from_path(path)
+    total_pages = info["Pages"]
+
+    for page_num in range(1, total_pages + 1):
+        images = pdf2image.convert_from_path(
+            path,
+            **kwargs,
+            first_page=page_num,
+            last_page=page_num,
+            thread_count=1,
+        )
+        yield images[0]
+
+
+def pymupdf_iter_from_path(path, dpi=600, grayscale=False):
+    """
+    stream page images
+    minimize memory usage for large input files
+    """
+    doc = pymupdf.open(path)
+    colorspace = pymupdf.csGRAY if grayscale else None
+    mode = "L" if grayscale else "RGB"
+    for page in doc:
+        pix = page.get_pixmap(dpi=dpi, colorspace=colorspace)
+        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+        yield img
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert PDF to black and white using adaptive thresholding.')
     parser.add_argument('input_pdf', help='Input PDF file')
@@ -140,6 +176,24 @@ def main():
         default=600,
         type=int,
     )
+    parser.add_argument(
+        "--backend", # args.backend
+        default="poppler",
+        choices=["poppler", "mupdf"],
+        help="PDF rendering backend",
+    )
+    r'''
+    parser.add_argument(
+        "--iter-pages", # args.iter_pages
+        action="store_true",
+    )
+    '''
+    r'''
+    parser.add_argument(
+        "--grayscale", # args.grayscale
+        action="store_true",
+    )
+    '''
     args = parser.parse_args()
 
     input_path = Path(args.input_pdf)
@@ -158,13 +212,23 @@ def main():
         print(f"Converting {input_path.name} to images...")
         kwargs = dict(
             dpi=args.dpi,
+            # grayscale=args.grayscale,
+            grayscale=True,
         )
-        pages = convert_from_path(str(input_path), **kwargs)
+        if args.backend == "mupdf":
+            pages = pymupdf_iter_from_path(input_path, **kwargs)
+        else:
+            # default backend: poppler
+            # pages = convert_from_path(input_path, **kwargs)
+            pages = pdf2image_iter_from_path(input_path, **kwargs)
+
+        info = pdf2image.pdfinfo_from_path(input_path)
+        total_pages = info["Pages"]
 
         # Process each page
         processed_pages = []
 
-        for page in tqdm(pages):
+        for page in tqdm(pages, total=total_pages, unit="page", ncols=80):
             binary = binarize_image(page, args)
             processed_pages.append(binary)
 

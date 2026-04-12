@@ -10,6 +10,7 @@ setup(
     ],
     install_requires=[
         "pdf2image",
+        "pymupdf",
         "opencv-python",
         "numpy",
         "Pillow",
