@@ -205,7 +205,8 @@ def main():
         print("Error: Input file must be a PDF")
         sys.exit(1)
 
-    output_path = input_path.parent / f"bw-{input_path.name}"
+    output_name = os.path.splitext(input_path.name)[0] + ".blackwhite.pdf"
+    output_path = input_path.parent / output_name
 
     try:
         # Convert PDF to images
