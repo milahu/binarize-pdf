@@ -9,9 +9,11 @@ import cv2
 from pdf2image import convert_from_path
 import pdf2image
 import pymupdf
+import io
 from PIL import Image
 from tqdm import tqdm
 import doxapy
+import zlib
 
 
 def mean_std(im, window_size):
@@ -123,7 +125,9 @@ def binarize_image(pil_img, args):
     # todo resize?
 
     # Convert back to PIL
-    return Image.fromarray(binary)
+    # binary = Image.fromarray(binary)
+
+    return binary
 
 
 def pdf2image_iter_from_path(path, **kwargs):
@@ -160,6 +164,201 @@ def pymupdf_iter_from_path(path, dpi=600, grayscale=False):
         yield img
 
 
+def make_page_filter(spec: str):
+    spec = spec.strip()
+    if not spec:
+        return lambda p: (False, False)  # never continue, never break
+
+    include = set()
+    ranges = []
+
+    max_finite = None
+    has_infinite_tail = False
+
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+
+        # "-N"
+        if part.startswith("-") and part != "-":
+            end = int(part[1:])
+            ranges.append(("lte", end))
+            max_finite = end if max_finite is None else max(max_finite, end)
+
+        # "N-"
+        elif part.endswith("-"):
+            start = int(part[:-1])
+            ranges.append(("gte", start))
+            has_infinite_tail = True
+
+        # "A-B"
+        elif "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                raise ValueError(f"Invalid range: {part}")
+            ranges.append(("range", a, b))
+            max_finite = b if max_finite is None else max(max_finite, b)
+
+        # single number
+        else:
+            v = int(part)
+            include.add(v)
+            max_finite = v if max_finite is None else max(max_finite, v)
+
+    def matcher(page: int):
+        # does this page match?
+        match = False
+
+        if page in include:
+            match = True
+
+        if not match:
+            for r in ranges:
+                if r[0] == "lte" and page <= r[1]:
+                    match = True
+                elif r[0] == "gte" and page >= r[1]:
+                    match = True
+                elif r[0] == "range" and r[1] <= page <= r[2]:
+                    match = True
+
+        # should_continue = skip page if NOT matched
+        should_continue = not match
+
+        # should_break logic
+        if has_infinite_tail:
+            should_break = False
+        elif max_finite is not None and page > max_finite:
+            should_break = True
+        else:
+            should_break = False
+
+        return should_break, should_continue
+
+    return matcher
+
+
+class StreamingPDFWriter:
+
+    def __init__(self, path):
+        self.f = open(path, "wb")
+        self.f.write(b"%PDF-1.7\n\n")
+        self.offsets = []
+        self.obj_id = 0
+        self.page_ids = []
+
+    def write_object(self, obj_body: bytes):
+        self.obj_id += 1
+        offset = self.f.tell()
+        self.offsets.append(offset)
+        self.f.write(f"{self.obj_id} 0 obj\n".encode("ascii"))
+        self.f.write(obj_body)
+        self.f.write(b"\nendobj\n\n")
+        return self.obj_id
+
+    def add_page_with_image(self, image_bytes, width, height, image_depth):
+        filters = []
+        compress = False
+        if compress:
+            image_bytes = zlib.compress(image_bytes)
+            filters.append("/FlateDecode")
+        width, height = int(width), int(height)
+
+        BitsPerComponent = 8
+        ColorSpace = "DeviceGray"
+
+        if image_depth == 1:
+            # ColorSpace = "DeviceGray"
+            BitsPerComponent = 1
+            filters.append("/CCITTFaxDecode")
+        elif image_depth == 24:
+            ColorSpace = "DeviceRGB"
+
+        img_id = self.write_object(
+            b"\n"
+            b"<< /Type /XObject\n"
+            b"   /Subtype /Image\n" +
+            f"   /Width {width}\n".encode("ascii") +
+            f"   /Height {height}\n".encode("ascii") +
+            f"   /ColorSpace /{ColorSpace}\n".encode("ascii") +
+            f"   /BitsPerComponent {BitsPerComponent}\n".encode("ascii") +
+            (f"   /Filter {' '.join(filters)}\n".encode("ascii") if filters else b"") +
+            f"   /Length {len(image_bytes)}\n".encode("ascii") +
+            b">>\n"
+            b"stream\n" +
+            image_bytes +
+            b"\nendstream\n"
+        )
+
+        content = (
+            "\n"
+            "q\n" +
+            f"{width} 0 0 {height} 0 0 cm\n" +
+            "/Im1 Do\n"
+            "Q\n"
+        ).encode("ascii")
+
+        content_id = self.write_object(
+            f"\n<< /Length {len(content)} >>\nstream\n".encode("ascii") +
+            content +
+            b"\nendstream\n"
+        )
+
+        page_id = self.write_object(
+            b"\n"
+            b"<< /Type /Page\n" +
+            f"   /MediaBox [0 0 {width} {height}]\n".encode("ascii") +
+            b"   /Resources <<\n" +
+            f"        /XObject << /Im1 {img_id} 0 R >>\n".encode("ascii") +
+            b"   >>\n" +
+            f"   /Contents {content_id} 0 R\n".encode("ascii") +
+            b">>\n"
+        )
+        self.page_ids.append(page_id)
+        return page_id
+
+    def close(self):
+
+        kids = " ".join(f"{pid} 0 R" for pid in self.page_ids)
+        pages_id = self.write_object(
+            b"\n"
+            b"<< /Type /Pages\n" +
+            f"   /Kids [ {kids} ]\n".encode("ascii") +
+            b"   /Count {len(self.page_ids)}\n"
+            b">>\n"
+        )
+
+        catalog_id = self.write_object(
+            b"\n"
+            b"<< /Type /Catalog\n" +
+            f"   /Pages {pages_id} 0 R\n".encode("ascii") +
+            b">>\n"
+        )
+
+        xref_offset = self.f.tell()
+
+        self.f.write(b"xref\n")
+        self.f.write(f"0 {len(self.offsets)+1}\n".encode("ascii"))
+
+        self.f.write(b"0000000000 65535 f \n")
+
+        for off in self.offsets:
+            self.f.write(f"{off:010d} 00000 n \n".encode("ascii"))
+
+        self.f.write(
+            b"\n"
+            b"trailer\n" +
+            f"<< /Size {len(self.offsets)+1}\n".encode("ascii") +
+            f"    /Root {catalog_id} 0 R >>\n".encode("ascii") +
+            b"startxref\n" +
+            f"{xref_offset}\n".encode("ascii") +
+            b"%EOF\n"
+        )
+
+        self.f.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert PDF to black and white using adaptive thresholding.')
     parser.add_argument('input_pdf', help='Input PDF file')
@@ -194,6 +393,29 @@ def main():
         action="store_true",
     )
     '''
+    parser.add_argument(
+        "--pages", # args.pages
+        default="",
+    )
+    parser.add_argument(
+        "--stream", # args.stream
+        action="store_true",
+        help="stream to the output PDF file, to reduce memory usage on large input files",
+    )
+    parser.add_argument(
+        "--output", # args.output
+        "-o",
+        help="path to output file",
+    )
+    parser.add_argument(
+        "--force", # args.force
+        action="store_true",
+        help="overwrite existing output file",
+    )
+    parser.add_argument(
+        "--debug", # args.debug
+        action="store_true",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input_pdf)
@@ -205,16 +427,20 @@ def main():
         print("Error: Input file must be a PDF")
         sys.exit(1)
 
-    output_name = os.path.splitext(input_path.name)[0] + ".blackwhite.pdf"
-    output_path = input_path.parent / output_name
+    if args.output:
+        output_path = args.output
+    else:
+        output_name = os.path.splitext(input_path.name)[0] + ".blackwhite.pdf"
+        output_path = input_path.parent / output_name
 
     try:
-        # Convert PDF to images
-        print(f"Converting {input_path.name} to images...")
+        # grayscale = args.grayscale
+        grayscale = True
+        image_depth = 8 if grayscale else 1
+        # image_depth = 24 # color # not possible?
         kwargs = dict(
             dpi=args.dpi,
-            # grayscale=args.grayscale,
-            grayscale=True,
+            grayscale=grayscale,
         )
         if args.backend == "mupdf":
             pages = pymupdf_iter_from_path(input_path, **kwargs)
@@ -226,25 +452,80 @@ def main():
         info = pdf2image.pdfinfo_from_path(input_path)
         total_pages = info["Pages"]
 
-        # Process each page
-        processed_pages = []
+        input_doc = pymupdf.open(input_path)
+
+        if os.path.exists(output_path):
+            if args.force:
+                os.unlink(output_path)
+            else:
+                print(f"error: output file exists: {str(output_path)!r}. hint: add --force")
+                sys.exit(1)
+
+        print(f"writing {str(output_path)!r}")
+
+        if args.stream:
+            output_doc = StreamingPDFWriter(output_path)
+        else:
+            output_doc = pymupdf.open()  # empty PDF
+
+        if args.debug:
+            debug_dir = Path("debug_images")
+            debug_dir.mkdir(exist_ok=True)
+
+        page_filter = make_page_filter(args.pages)
+
+        page_idx = -1
 
         for page in tqdm(pages, total=total_pages, unit="page", ncols=80):
-            binary = binarize_image(page, args)
-            processed_pages.append(binary)
 
-        print(f"Saving binarized PDF to {output_path}...")
-        if processed_pages:
-            processed_pages[0].save(
-                str(output_path),
-                "PDF",
-                save_all=True,
-                append_images=processed_pages[1:],
-            )
-            print("Done!")
-        else:
-            print("Error: No pages were processed")
-            sys.exit(1)
+            page_idx += 1
+
+            should_break, should_continue = page_filter(page_idx + 1)
+            if should_break: break
+            if should_continue: continue
+
+            binary = binarize_image(page, args)
+            # page: PIL.PpmImagePlugin.PpmImageFile
+            # binary: np.array
+
+            if args.debug:
+                page.save(debug_dir / f"page{page_idx}_1_original.png")
+                Image.fromarray(binary).save(debug_dir / f"page{page_idx}_2_binary.png")
+
+            rect = input_doc[page_idx].rect
+
+            if not args.stream:
+                out_page = output_doc.new_page(width=rect.width, height=rect.height)
+                colorspace = pymupdf.csGRAY if grayscale else pymupdf.csRGB
+                h, w = binary.shape[:2]
+                pix = pymupdf.Pixmap(colorspace, w, h, binary.tobytes(), False)
+                out_page.insert_image(rect, pixmap=pix)
+
+            if args.stream:
+                # binary = binary.astype(np.uint8)
+                # binary = np.ascontiguousarray(binary)
+
+                # # if binarized 0/1 then scale to 0/255
+                # if binary.max() == 1:
+                #     binary = binary * 255
+
+                # TODO preserve the original page size?
+                # but then we need to scale the page image
+                # height, width = rect.height, rect.width # wrong!
+                height, width = binary.shape[:2]
+
+                output_doc.add_page_with_image(
+                    binary.tobytes(),
+                    width,
+                    height,
+                    image_depth,
+                )
+
+        if not args.stream:
+            output_doc.save(output_path)
+
+        output_doc.close()
+        input_doc.close()
 
     except Exception as e:
         print(f"Error processing PDF: {str(e)}")
