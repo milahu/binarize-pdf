@@ -16,6 +16,7 @@ setup(
         "Pillow",
         "tqdm",
         "doxapy",
+        "tifffile",
     ],
     python_requires=">=3.8",
 )

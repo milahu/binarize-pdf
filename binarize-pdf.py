@@ -14,6 +14,8 @@ from PIL import Image
 from tqdm import tqdm
 import doxapy
 import zlib
+import tifffile
+import math
 
 
 def mean_std(im, window_size):
@@ -257,12 +259,69 @@ class StreamingPDFWriter:
         self.f.write(b"\nendobj\n\n")
         return self.obj_id
 
-    def add_page_with_image(self, image_bytes, width, height, image_depth):
+    # TODO pass args
+    def add_page_with_image(self, image, width, height, image_depth, image_quality):
         filters = []
-        compress = False
-        if compress:
-            image_bytes = zlib.compress(image_bytes)
-            filters.append("/FlateDecode")
+        DecodeParms = None
+
+        if image_depth == 1:
+            if 1:
+                # CCITT Group 4 compression
+                pil_img = Image.fromarray(image, mode="L").convert("1")
+                tiff_buf = io.BytesIO()
+                strip_size = math.ceil(pil_img.width / 8) * pil_img.height
+                pil_img.save(
+                    tiff_buf,
+                    format="TIFF",
+                    compression="group4",
+                    strip_size=strip_size, # produce single strip
+                )
+                tiff_buf.seek(0)
+                with tifffile.TiffFile(tiff_buf) as tiff:
+                    page = tiff.pages[0]
+                    assert len(page.dataoffsets) == 1 # require single strip
+                    offset = page.dataoffsets[0]
+                    size = page.databytecounts[0]
+                tiff_buf.seek(offset)
+                ccitt_bytes = tiff_buf.read(size)
+                del tiff_buf
+                image_bytes = ccitt_bytes
+                filters.append("/CCITTFaxDecode")
+                DecodeParms = (
+                    b"<<\n"
+                    b"      /K -1\n" +
+                    f"      /Columns {width}\n".encode("ascii") +
+                    f"      /Rows {height}\n".encode("ascii") +
+                    b"      /BlackIs1 true\n"
+                    b"   >>"
+                )
+            elif 0:
+                # Deflate compression
+                packed = np.packbits(image, axis=1, bitorder="big")
+                image_bytes = zlib.compress(packed.tobytes())
+                filters.append("/FlateDecode")
+
+        elif image_depth in (8, 24):
+            if 1:
+                grayscale = image_depth <= 8
+                colorspace = pymupdf.csGRAY if grayscale else pymupdf.csRGB
+                h, w = image.shape[:2]
+                pix = pymupdf.Pixmap(colorspace, w, h, image.tobytes(), False)
+                image_bytes = pix.tobytes("jpg", jpg_quality=image_quality)
+            elif 0:
+                options = [
+                    int(cv2.IMWRITE_JPEG_QUALITY), image_quality,
+                    # FIXME colorspace
+                ]
+                success, jpeg = cv2.imencode(".jpeg", image, options)
+                if not success:
+                    raise RuntimeError("JPEG encoding failed")
+                image_bytes = jpeg.tobytes()
+            filters.append("/DCTDecode") # jpeg
+
+        else:
+            raise ValueError(f"bad image_depth {image_depth}")
+
         width, height = int(width), int(height)
 
         BitsPerComponent = 8
@@ -271,7 +330,6 @@ class StreamingPDFWriter:
         if image_depth == 1:
             # ColorSpace = "DeviceGray"
             BitsPerComponent = 1
-            filters.append("/CCITTFaxDecode")
         elif image_depth == 24:
             ColorSpace = "DeviceRGB"
 
@@ -284,6 +342,7 @@ class StreamingPDFWriter:
             f"   /ColorSpace /{ColorSpace}\n".encode("ascii") +
             f"   /BitsPerComponent {BitsPerComponent}\n".encode("ascii") +
             (f"   /Filter {' '.join(filters)}\n".encode("ascii") if filters else b"") +
+            ((b"   /DecodeParms " + DecodeParms + b"\n") if DecodeParms else b"") +
             f"   /Length {len(image_bytes)}\n".encode("ascii") +
             b">>\n"
             b"stream\n" +
@@ -392,16 +451,29 @@ def main():
         "--grayscale", # args.grayscale
         action="store_true",
     )
+    parser.add_argument(
+        "--singlebit", # args.singlebit
+        action="store_true",
+    )
     '''
     parser.add_argument(
         "--pages", # args.pages
         default="",
     )
+    r'''
     parser.add_argument(
         "--stream", # args.stream
         action="store_true",
         help="stream to the output PDF file, to reduce memory usage on large input files",
     )
+    default_jpeg_quality = 95
+    parser.add_argument(
+        "--quality", # args.quality
+        default=default_jpeg_quality,
+        type=int,
+        help=f"JPEG compression quality in percent. default: {default_jpeg_quality}",
+    )
+    '''
     parser.add_argument(
         "--output", # args.output
         "-o",
@@ -418,6 +490,10 @@ def main():
     )
     args = parser.parse_args()
 
+    args.grayscale = False
+    args.stream = True
+    args.quality = 95
+
     input_path = Path(args.input_pdf)
     if not input_path.exists():
         print(f"Error: File {input_path} does not exist")
@@ -427,6 +503,10 @@ def main():
         print("Error: Input file must be a PDF")
         sys.exit(1)
 
+    if not (1 <= args.quality <= 100):
+        print("Error: Quality is out of range, must be between 1 and 100")
+        sys.exit(1)
+
     if args.output:
         output_path = args.output
     else:
@@ -434,13 +514,12 @@ def main():
         output_path = input_path.parent / output_name
 
     try:
-        # grayscale = args.grayscale
-        grayscale = True
-        image_depth = 8 if grayscale else 1
+        # todo remove grayscale?
+        image_depth = 8 if args.grayscale else 1
         # image_depth = 24 # color # not possible?
         kwargs = dict(
             dpi=args.dpi,
-            grayscale=grayscale,
+            grayscale=True,
         )
         if args.backend == "mupdf":
             pages = pymupdf_iter_from_path(input_path, **kwargs)
@@ -496,10 +575,33 @@ def main():
 
             if not args.stream:
                 out_page = output_doc.new_page(width=rect.width, height=rect.height)
-                colorspace = pymupdf.csGRAY if grayscale else pymupdf.csRGB
+                # todo remove RGB?
+                # colorspace = pymupdf.csGRAY if grayscale else pymupdf.csRGB
+                colorspace = pymupdf.csGRAY
                 h, w = binary.shape[:2]
                 pix = pymupdf.Pixmap(colorspace, w, h, binary.tobytes(), False)
-                out_page.insert_image(rect, pixmap=pix)
+
+                # FIXME handle image_depth == 1
+                # we cannot use pymupdf to insert raw CCITT-G4 images?
+                assert image_depth in (8, 24)
+
+                if 1:
+                    # TODO pass jpg_quality=args.quality
+                    out_page.insert_image(rect, pixmap=pix)
+
+                elif 0:
+                    pix_bytes = pix.tobytes("jpg", jpg_quality=args.quality)
+                    out_page.insert_image(rect, stream=pix_bytes)
+
+                elif 0:
+                    options = [
+                        int(cv2.IMWRITE_JPEG_QUALITY), args.quality,
+                        # FIXME colorspace
+                    ]
+                    success, jpeg = cv2.imencode(".jpeg", binary, options)
+                    if not success:
+                        raise RuntimeError("JPEG encoding failed")
+                    out_page.insert_image(rect, stream=jpeg.tobytes())
 
             if args.stream:
                 # binary = binary.astype(np.uint8)
@@ -515,10 +617,11 @@ def main():
                 height, width = binary.shape[:2]
 
                 output_doc.add_page_with_image(
-                    binary.tobytes(),
+                    binary,
                     width,
                     height,
                     image_depth,
+                    args.quality,
                 )
 
         if not args.stream:
