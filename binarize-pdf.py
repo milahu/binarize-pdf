@@ -95,15 +95,12 @@ def binarize_image(pil_img, args):
     Apply binarization to an image using a combination of methods.
     Uses adaptive window size for Sauvola binarization.
     """
-    # Convert PIL to numpy
-    np_img = np.array(pil_img)
-
     # Convert to grayscale if needed
     if pil_img.mode != "L":
-        np_img = doxapy.to_grayscale(
-            doxapy.GrayscaleAlgorithms.MEAN,
-            np_img
-        )
+        pil_img = pil_img.convert("L")
+
+    # Convert PIL to numpy
+    np_img = np.array(pil_img)
 
     window_size = calculate_adaptive_window_size(np_img.shape)
     # print(f"Using adaptive window size: {window_size}")
