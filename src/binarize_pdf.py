@@ -30,51 +30,59 @@ if 1:
     )
 
 
-DEFAULT_DPI = 300
+# TODO expose CLI option
+DEFAULT_DPI = 600
+
 DEFAULT_WINDOW = 75
 DEFAULT_K = 0.2
 
 
 def binarize(image: Image.Image) -> Image.Image:
-    """Binarize a rendered PDF page with Doxa/Sauvola."""
-
-    grayscale = np.asarray(
+    grayscale = np.array(
         image.convert("L"),
         dtype=np.uint8,
+        order="C",
+        copy=True,
     )
 
-    # This is deliberately written exactly like the
-    # standalone test that was confirmed to work.
-    # algorithm = doxapy.Binarization.Algorithms.SAUVOLA
-    algorithm = doxapy.doxapy.Binarization.Algorithms.SAUVOLA
+    algorithm = doxapy.Binarization.Algorithms.SAUVOLA
 
-    # DEBUG: this MUST be Binarization.Algorithms.
-    print(
-        f"    Doxa algorithm: {algorithm!r}",
-        flush=True,
-    )
-    print(
-        f"    Doxa algorithm type: {type(algorithm)!r}",
-        flush=True,
-    )
+    if 0:
+        # debug
+        print("    doxapy module:", doxapy.__file__, flush=True)
+        print(
+            "    to_binary:",
+            doxapy.to_binary,
+            flush=True,
+        )
+        print(
+            "    algorithm:",
+            algorithm,
+            flush=True,
+        )
+        print(
+            "    algorithm type:",
+            type(algorithm),
+            flush=True,
+        )
+        print(
+            "    enum class:",
+            doxapy.Binarization.Algorithms,
+            flush=True,
+        )
+        print(
+            "    image:",
+            grayscale.shape,
+            grayscale.dtype,
+            grayscale.flags["C_CONTIGUOUS"],
+            grayscale.flags["WRITEABLE"],
+            flush=True,
+        )
 
-    r'''
     result = doxapy.to_binary(
         algorithm,
         grayscale,
-        {
-            "window": DEFAULT_WINDOW,
-            "k": DEFAULT_K,
-        },
-    )
-    '''
-    result = doxapy.to_binary(
-        doxapy.doxapy.Binarization.Algorithms.SAUVOLA,
-        grayscale,
-        {
-            "window": DEFAULT_WINDOW,
-            "k": DEFAULT_K,
-        },
+        {"window": 75, "k": 0.2},
     )
 
     return Image.fromarray(
@@ -114,12 +122,6 @@ def main() -> None:
         type=Path,
     )
 
-    parser.add_argument(
-        "--grayscale",
-        action="store_true",
-        help="use grayscale instead of Doxa bitonal output",
-    )
-
     args = parser.parse_args()
 
     input_path = args.input
@@ -154,12 +156,10 @@ def main() -> None:
             # Render the COMPLETE visual page.
             rendered = render_page(page)
 
-            if args.grayscale:
-                processed = rendered.convert("L")
-            else:
-                processed = binarize(rendered)
+            processed = binarize(rendered)
 
             # PNG is lossless.
+            # FIXME PNG is slow
             buffer = io.BytesIO()
             processed.save(
                 buffer,
