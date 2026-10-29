@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binarize-pdf"
+version = "0.1.0"
+dependencies = [
+  "pymupdf",
+  "pillow",
+  "doxapy",
+]
+requires-python = ">=3.8"
+authors = [
+  {name = "Milan Hauth", email = "milahu@milahu.duckdns.org"},
+]
+maintainers = [
+]
+description = "convert ugly gray-on-yellow PDF files to pretty black-on-white PDF files"
+readme = "readme.md"
+license = "MIT"
+license-files = ["license.txt"]
+keywords = [
+  "adaptive-thresholding",
+  "binarization",
+  "high-contrast",
+  "pdf",
+  "pdf-cleaner",
+  "pdf-restoration",
+  "readability",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python"
+]
+
+[project.urls]
+Homepage = "https://github.com/milahu/binarize-pdf"
+
+[project.scripts]
+binarize-pdf = "binarize_pdf:main"
+
+# [project.entry-points."spam.magical"]
+# tomatoes = "spam:main_tomatoes"
