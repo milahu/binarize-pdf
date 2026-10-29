@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
 
 """
-Binarize PDF pages using Doxa's adaptive binarization while preserving
-the original PDF's text layer.
-
-For each page:
-
-1. Render the complete PDF page to an image at the requested DPI.
-   This captures text, raster images, vector graphics, transparency, etc.
-2. Convert the rendered image to grayscale.
-3. Either:
-   - leave it as grayscale, or
-   - apply Doxa's adaptive Sauvola binarization.
-4. Put the resulting image over the original page.
-5. Leave the original PDF content untouched underneath, thereby preserving
-   its existing searchable / selectable text layer.
-
-The output is therefore visually represented by the processed page image,
-while the original PDF text remains available to PDF text extraction/OCR
-software.
-
-Dependencies:
-
-    python -m pip install pymupdf pillow doxapy
-
-DoxaPy currently requires Python 3.12+.
+Render each page of a PDF, binarize the rendered page with Doxa/Sauvola,
+and overlay the resulting image while preserving the original PDF
+content and text layer.
 
 Usage:
 
@@ -36,9 +15,13 @@ Usage:
 
     python binarize_pdf.py input.pdf -o output.pdf
 
-The default output name is:
+The default output filename is:
 
     input.pdf -> input.blackwhite.pdf
+
+Dependencies:
+
+    python -m pip install pymupdf pillow numpy doxapy
 """
 
 from __future__ import annotations
@@ -51,70 +34,78 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 from PIL import Image
-
 import doxapy
 
 
-# Rendering DPI. 300 is a reasonable default for document/OCR work.
 DEFAULT_DPI = 300
-
-# Sauvola parameters.
-#
-# Doxa's example uses window=75 and k=0.2. These are deliberately kept
-# here as constants so they are easy to change for a particular document
-# collection.
 DEFAULT_WINDOW = 75
 DEFAULT_K = 0.2
 
 
 def default_output_path(input_path: Path) -> Path:
-    """Return the default output path for an input PDF."""
-    if input_path.suffix.lower() == ".pdf":
-        return input_path.with_suffix(".blackwhite.pdf")
-
-    # The CLI says the input should be a PDF, but this makes the function
-    # behave sensibly if called independently.
-    return input_path.with_name(input_path.name + ".blackwhite.pdf")
+    """Return INPUT.blackwhite.pdf."""
+    return input_path.with_suffix(".blackwhite.pdf")
 
 
-def render_page(page: pymupdf.Page, dpi: int) -> Image.Image:
+def render_page(
+    page: pymupdf.Page,
+    dpi: int,
+) -> Image.Image:
     """
-    Render an entire PDF page to an RGB PIL image.
+    Render the complete visual appearance of a PDF page.
 
-    Rendering the page rather than extracting individual PDF images is
-    intentional: the result represents the visual appearance of the
-    complete PDF page, including text, vector graphics, images,
+    This includes PDF text, raster images, vector graphics, annotations,
     transparency, etc.
     """
-    pixmap = page.get_pixmap(
+    pix = page.get_pixmap(
         dpi=dpi,
         colorspace=pymupdf.csRGB,
         alpha=False,
         annots=True,
     )
 
-    # Pixmap samples are RGB because csRGB was requested.
-    image = Image.frombytes(
+    return Image.frombytes(
         "RGB",
-        (pixmap.width, pixmap.height),
-        pixmap.samples,
+        (pix.width, pix.height),
+        pix.samples,
     )
-
-    return image
 
 
 def binarize_with_doxa(
     image: Image.Image,
-    window: int = DEFAULT_WINDOW,
-    k: float = DEFAULT_K,
+    window: int,
+    k: float,
 ) -> Image.Image:
+    """
+    Apply Doxa's adaptive Sauvola binarization.
+
+    This is the exact API used by the current DoxaPy documentation and
+    verified against the user's installed DoxaPy version.
+    """
     grayscale = np.asarray(
         image.convert("L"),
         dtype=np.uint8,
     )
 
+    if grayscale.ndim != 2:
+        raise RuntimeError(
+            f"Doxa requires a 2-D grayscale image; "
+            f"got {grayscale.shape}"
+        )
+
+    # IMPORTANT:
+    #
+    # This MUST be Binarization.Algorithms.SAUVOLA.
+    #
+    # Do NOT replace this with:
+    #
+    #     doxapy.Algorithms.SAUVOLA
+    #
+    # Those are different enum types.
+    algorithm = doxapy.Binarization.Algorithms.SAUVOLA
+
     binary = doxapy.to_binary(
-        doxapy.Binarization.Algorithms.SAUVOLA,
+        algorithm,
         grayscale,
         {
             "window": window,
@@ -122,10 +113,29 @@ def binarize_with_doxa(
         },
     )
 
-    return Image.fromarray(
-        np.asarray(binary, dtype=np.uint8),
-        mode="L",
+    binary = np.asarray(binary, dtype=np.uint8)
+
+    # Doxa normally returns 0/255. Normalize it explicitly anyway.
+    binary = np.where(
+        binary != 0,
+        255,
+        0,
+    ).astype(np.uint8)
+
+    return Image.fromarray(binary, mode="L")
+
+
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    """Encode an image as lossless PNG bytes."""
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="PNG",
+        optimize=True,
     )
+
+    return output.getvalue()
 
 
 def process_pdf(
@@ -136,97 +146,109 @@ def process_pdf(
     window: int,
     k: float,
 ) -> None:
-    """Process all pages of input_path and save output_path."""
+    """Process the PDF."""
 
     if input_path.resolve() == output_path.resolve():
         raise ValueError(
-            "The output file must not be the same as the input file."
+            "Input and output PDF must be different files."
         )
 
     with pymupdf.open(input_path) as document:
         page_count = len(document)
 
         print(
-            f"Processing {input_path} "
-            f"({page_count} page{'s' if page_count != 1 else ''})..."
+            f"Processing {page_count} pages from "
+            f"{input_path}",
+            file=sys.stderr,
         )
 
-        for page_number, page in enumerate(document, start=1):
+        for page_number, page in enumerate(
+            document,
+            start=1,
+        ):
             print(
                 f"  Page {page_number}/{page_count}",
                 file=sys.stderr,
+                flush=True,
             )
 
-            # Render the complete visual appearance of the page.
-            rendered = render_page(page, dpi)
+            # Render the complete visual page.
+            rendered = render_page(
+                page,
+                dpi,
+            )
 
+            # Convert the rendered snapshot.
             if mode == "grayscale":
                 processed = rendered.convert("L")
+
             elif mode == "bitonal":
                 processed = binarize_with_doxa(
                     rendered,
-                    window=window,
-                    k=k,
+                    window,
+                    k,
                 )
+
             else:
-                # argparse prevents this, but keep the function defensive.
-                raise ValueError(f"Unknown mode: {mode}")
+                raise ValueError(
+                    f"Unknown mode: {mode}"
+                )
 
-            image_stream = image_to_pdf_stream(processed)
+            png_bytes = image_to_png_bytes(
+                processed
+            )
 
-            # Cover the original visual content with the processed
-            # page image.
+            # Put the processed image on top of the
+            # existing PDF page.
             #
-            # IMPORTANT:
+            # The original PDF page contents are NOT deleted.
             #
-            # We deliberately do NOT delete or replace the original PDF
-            # page contents. The new image is opaque and visually replaces
-            # them, while the original text objects remain underneath.
+            # Therefore:
             #
-            # Thus PDF text extraction/search continues to see the
-            # original text layer.
+            #   visible appearance = processed image
+            #
+            #   searchable text    = original PDF text layer
+            #
             page.insert_image(
                 page.rect,
-                stream=image_stream,
+                stream=png_bytes,
                 keep_proportion=False,
                 overlay=True,
             )
 
-        # garbage=4 removes unused objects created during processing,
-        # deflate=True compresses streams where possible.
-        #
-        # We use a temporary output file rather than writing directly over
-        # an existing file.
-        temp_output = output_path.with_name(
+        # Save to a temporary file first so that a failed
+        # operation doesn't destroy an existing output.
+        temporary_path = output_path.with_name(
             output_path.name + ".tmp"
         )
 
         try:
             document.save(
-                temp_output,
+                temporary_path,
                 garbage=4,
                 deflate=True,
                 clean=True,
             )
 
-            # Replace any existing destination only after a successful save.
-            temp_output.replace(output_path)
+            temporary_path.replace(output_path)
 
         except Exception:
-            try:
-                temp_output.unlink(missing_ok=True)
-            except Exception:
-                pass
+            temporary_path.unlink(
+                missing_ok=True
+            )
             raise
 
-    print(f"Written: {output_path}")
+    print(
+        f"Written: {output_path}",
+        file=sys.stderr,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Render each PDF page, apply Doxa adaptive binarization, "
-            "and overlay the result while preserving the original "
+            "Render PDF pages and apply Doxa adaptive "
+            "binarization while preserving the original "
             "PDF text layer."
         )
     )
@@ -241,7 +263,10 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="output PDF path (default: INPUT.blackwhite.pdf)",
+        help=(
+            "output PDF path "
+            "(default: INPUT.blackwhite.pdf)"
+        ),
     )
 
     parser.add_argument(
@@ -249,9 +274,8 @@ def parse_args() -> argparse.Namespace:
         choices=("bitonal", "grayscale"),
         default="bitonal",
         help=(
-            "output image mode: bitonal uses Doxa adaptive Sauvola "
-            "binarization; grayscale only converts the rendered page "
-            "to grayscale (default: bitonal)"
+            "processed page image mode "
+            "(default: bitonal)"
         ),
     )
 
@@ -259,7 +283,10 @@ def parse_args() -> argparse.Namespace:
         "--dpi",
         type=int,
         default=DEFAULT_DPI,
-        help=f"rendering resolution in DPI (default: {DEFAULT_DPI})",
+        help=(
+            f"PDF rendering resolution in DPI "
+            f"(default: {DEFAULT_DPI})"
+        ),
     )
 
     parser.add_argument(
@@ -267,7 +294,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_WINDOW,
         help=(
-            "Doxa Sauvola local window size in pixels "
+            f"Sauvola local window size "
             f"(default: {DEFAULT_WINDOW})"
         ),
     )
@@ -277,7 +304,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_K,
         help=(
-            "Doxa Sauvola k parameter "
+            f"Sauvola k parameter "
             f"(default: {DEFAULT_K})"
         ),
     )
@@ -288,13 +315,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dpi must be greater than zero")
 
     if args.window <= 0:
-        parser.error("--window must be greater than zero")
+        parser.error("--window must be positive")
 
     if args.window % 2 == 0:
-        parser.error("--window must be an odd number")
+        parser.error("--window must be odd")
 
     if not 0 < args.k < 1:
-        parser.error("--k must be greater than 0 and less than 1")
+        parser.error("--k must be between 0 and 1")
 
     return args
 
@@ -302,24 +329,29 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    input_path: Path = args.input
+    input_path = args.input
 
     if not input_path.is_file():
         print(
-            f"error: input file does not exist: {input_path}",
+            f"error: input file does not exist: "
+            f"{input_path}",
             file=sys.stderr,
         )
         return 2
 
     if input_path.suffix.lower() != ".pdf":
         print(
-            f"error: input file does not have a .pdf extension: "
+            f"error: input file must have a .pdf extension: "
             f"{input_path}",
             file=sys.stderr,
         )
         return 2
 
-    output_path = args.output or default_output_path(input_path)
+    output_path = (
+        args.output
+        if args.output is not None
+        else default_output_path(input_path)
+    )
 
     try:
         process_pdf(
@@ -330,8 +362,12 @@ def main() -> int:
             window=args.window,
             k=args.k,
         )
+
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(
+            f"error: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
     return 0
