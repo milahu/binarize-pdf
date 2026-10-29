@@ -12,8 +12,9 @@ from PIL import Image
 import doxapy
 
 
-if 1:
-    # debug
+DEBUG = False
+
+if DEBUG:
     print("DOXAPY FILE:", doxapy.__file__)
     print("DOXAPY TO_BINARY:", doxapy.to_binary)
     print(
@@ -47,8 +48,7 @@ def binarize(image: Image.Image) -> Image.Image:
 
     algorithm = doxapy.Binarization.Algorithms.SAUVOLA
 
-    if 0:
-        # debug
+    if DEBUG:
         print("    doxapy module:", doxapy.__file__, flush=True)
         print(
             "    to_binary:",
